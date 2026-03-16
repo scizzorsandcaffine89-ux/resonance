@@ -306,10 +306,29 @@ body.edit-mode .page-title:focus {
 .np-art {
   width: 48px; height: 48px; background: var(--bg4); border-radius: 3px;
   flex-shrink: 0; display: flex; align-items: center; justify-content: center;
-  font-size: 20px; border: 1px solid var(--border);
+  font-size: 20px; border: 1px solid var(--border); overflow: hidden;
   animation: spin 8s linear infinite; animation-play-state: paused;
 }
 .now-playing.playing .np-art { animation-play-state: running; border-radius: 50%; }
+.np-art img { width: 100%; height: 100%; object-fit: cover; border-radius: inherit; }
+.lfm-widget {
+  display: flex; align-items: center; gap: 14px;
+  padding: 14px 16px; background: var(--bg2); border: 1px solid var(--border);
+  max-width: 480px; position: relative; overflow: hidden;
+}
+.lfm-art {
+  width: 56px; height: 56px; flex-shrink: 0; background: var(--bg4);
+  border: 1px solid var(--border); border-radius: 3px; overflow: hidden;
+  display: flex; align-items: center; justify-content: center; font-size: 22px;
+}
+.lfm-art img { width: 100%; height: 100%; object-fit: cover; }
+.lfm-info { flex: 1; min-width: 0; }
+.lfm-status { font-family: 'Fragment Mono', monospace; font-size: 8px; color: var(--text3); letter-spacing: 0.15em; margin-bottom: 3px; display: flex; align-items: center; gap: 5px; }
+.lfm-track { font-family: 'Unbounded', sans-serif; font-size: 12px; color: var(--white); font-weight: 400; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lfm-artist { font-family: 'Fragment Mono', monospace; font-size: 10px; color: var(--text3); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lfm-album { font-family: 'Fragment Mono', monospace; font-size: 9px; color: var(--smoke3); margin-top: 2px; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lfm-scrobbles { font-family: 'Fragment Mono', monospace; font-size: 8px; color: var(--smoke3); margin-left: auto; flex-shrink: 0; text-align: right; line-height: 1.6; }
+.lfm-loading { font-family: 'Fragment Mono', monospace; font-size: 10px; color: var(--text3); font-style: italic; padding: 12px 0; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .np-info { flex: 1; min-width: 0; }
 .np-label { font-family: 'Fragment Mono', monospace; font-size: 8px; color: var(--text3); letter-spacing: 0.15em; margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
@@ -1512,7 +1531,10 @@ body.edit-mode .card-actions { display: flex; }
       <div class="page-headline" id="ph-headline-5" contenteditable="false">what i'm listening to.</div>
     </div>
     <div class="content-area">
-      <div class="grid-2">
+      <div class="divider">live — last.fm</div>
+      <div id="lfm-widget-container"><div class="lfm-loading">fetching what's playing… ♪</div></div>
+
+      <div class="grid-2" style="margin-top:32px">
         <div>
           <div class="divider">tracklist</div>
           <div class="tracklist" id="tracklist"></div>
@@ -2118,6 +2140,7 @@ function showPage(id) {
   });
   if (id === 'relations') setTimeout(drawRelCanvas, 100);
   if (id === 'stats') { renderStatsAuto(); renderStatsCustom(); }
+  if (id === 'music') { pollLastFm(); }
   // close sidebar on mobile after nav
   if (window.innerWidth <= 900) {
     document.getElementById('sidebar').classList.remove('open');
@@ -2612,6 +2635,29 @@ function toast(msg) {
 // load through an <img> with crossOrigin='anonymous' and paint to canvas.
 function imgToBase64(source, maxSize=600) {
   return new Promise(resolve => {
+    // GIFs must never go through canvas — it kills the animation.
+    // Detect by file type or URL extension and pass through as-is.
+    function isGif(src) {
+      if (typeof src === 'string') return src.toLowerCase().includes('.gif') || src.startsWith('data:image/gif');
+      if (src instanceof File) return src.type === 'image/gif';
+      return false;
+    }
+
+    if (isGif(source)) {
+      // For a GIF file, read as base64 directly without canvas
+      if (source instanceof File) {
+        const reader = new FileReader();
+        reader.onload = e => resolve(e.target.result);
+        reader.onerror = () => resolve(null);
+        reader.readAsDataURL(source);
+      } else {
+        // GIF url — just use it directly, canvas would break it
+        resolve(source);
+      }
+      return;
+    }
+
+    // For everything else (jpg, png, webp, etc.) use canvas to resize + encode
     const img = new Image();
     img.crossOrigin = 'anonymous';
     img.onload = () => {
@@ -2624,15 +2670,14 @@ function imgToBase64(source, maxSize=600) {
       try {
         resolve(canvas.toDataURL('image/jpeg', 0.82));
       } catch(e) {
-        // CORS blocked — just use the URL directly as fallback
-        resolve(source);
+        // CORS blocked — use the source directly as fallback
+        resolve(typeof source === 'string' ? source : null);
       }
     };
     img.onerror = () => resolve(null);
     if (typeof source === 'string') {
       img.src = source;
     } else {
-      // it's a File object
       const reader = new FileReader();
       reader.onload = e => { img.src = e.target.result; };
       reader.readAsDataURL(source);
@@ -3118,6 +3163,103 @@ function exportSite() {
   toast('exported!');
 }
 
+// ── LAST.FM LIVE ──
+const LFM_KEY  = '91c8ba8143813c77eb87f5aaa69a4e69';
+const LFM_USER = 'resonanceofsoul';
+let lfmPollInterval = null;
+let lfmLast = null;
+
+async function fetchLastFm() {
+  try {
+    const url = `https://ws.audioscrobbler.com/2.0/?method=user.getrecenttracks&user=${LFM_USER}&api_key=${LFM_KEY}&format=json&limit=1`;
+    const res = await fetch(url);
+    if (!res.ok) return null;
+    const data = await res.json();
+    const tracks = data?.recenttracks?.track;
+    if (!tracks) return null;
+    const track = Array.isArray(tracks) ? tracks[0] : tracks;
+    const nowPlaying = track['@attr']?.nowplaying === 'true';
+    const art = track.image?.find(i => i.size === 'large')?.['#text'] || '';
+    return {
+      nowPlaying,
+      name:   track.name || '—',
+      artist: track.artist?.['#text'] || track.artist || '—',
+      album:  track.album?.['#text'] || '',
+      art:    art && !art.includes('2a96cbd8b46e442fc41c2b86b821562f') ? art : '',
+      url:    track.url || '',
+      playcount: data.recenttracks?.['@attr']?.total || '',
+    };
+  } catch(e) { return null; }
+}
+
+function renderLfmWidget(track) {
+  const el = document.getElementById('lfm-widget-container');
+  if (!el) return;
+  if (!track) {
+    el.innerHTML = `<div class="lfm-loading">couldn't reach last.fm right now.</div>`;
+    return;
+  }
+  const dot = track.nowPlaying
+    ? `<div class="np-dot"></div> now playing`
+    : `last scrobbled`;
+  const artHtml = track.art
+    ? `<img src="${track.art}" alt="album art" crossorigin="anonymous">`
+    : '♪';
+  el.innerHTML = `
+    <div class="lfm-widget">
+      <div class="lfm-art">${artHtml}</div>
+      <div class="lfm-info">
+        <div class="lfm-status">${dot}</div>
+        <div class="lfm-track">${escapeHtml(track.name)}</div>
+        <div class="lfm-artist">${escapeHtml(track.artist)}</div>
+        ${track.album ? `<div class="lfm-album">${escapeHtml(track.album)}</div>` : ''}
+      </div>
+      ${track.playcount ? `<div class="lfm-scrobbles">${Number(track.playcount).toLocaleString()}<br>scrobbles</div>` : ''}
+    </div>`;
+}
+
+function updateHomeNowPlaying(track) {
+  if (!track) return;
+  const widget = document.getElementById('now-playing-widget');
+  const nameEl = document.getElementById('np-track-name');
+  const artistEl = document.getElementById('np-artist-name');
+  const artEl = document.getElementById('np-art-icon');
+  if (!widget || !nameEl || !artistEl) return;
+
+  nameEl.textContent = track.name;
+  artistEl.textContent = track.artist;
+
+  // album art in the spinning disc
+  if (track.art) {
+    artEl.innerHTML = `<img src="${track.art}" alt="art" crossorigin="anonymous">`;
+  } else {
+    artEl.innerHTML = '♪';
+  }
+
+  if (track.nowPlaying) {
+    widget.classList.add('playing');
+  } else {
+    widget.classList.remove('playing');
+  }
+}
+
+async function pollLastFm() {
+  const track = await fetchLastFm();
+  // only re-render if something changed
+  const hash = JSON.stringify(track);
+  if (hash !== lfmLast) {
+    lfmLast = hash;
+    renderLfmWidget(track);
+    updateHomeNowPlaying(track);
+  }
+}
+
+function startLfmPolling() {
+  pollLastFm(); // immediate first fetch
+  clearInterval(lfmPollInterval);
+  lfmPollInterval = setInterval(pollLastFm, 30000);
+}
+
 // ── NOW PLAYING EMBED ──
 function renderNowPlayingEmbed() {
   const container = document.getElementById('np-embed-container');
@@ -3381,6 +3523,9 @@ async function init() {
 
   // register service worker early so push is ready before entering chat
   registerServiceWorker();
+
+  // start last.fm live polling
+  startLfmPolling();
 }
 
 init();
